@@ -1,6 +1,6 @@
-torch>=2.0.0
-torchvision>=0.15.0
-numpy>=1.22.0
-matplotlib>=3.5.0
-scikit-learn>=1.0.0
-jupyter>=1.0.0
+torch>=2.0
+torchvision>=0.15
+numpy>=1.22
+matplotlib>=3.5
+scikit-learn>=1.0
+jupyter>=1.0

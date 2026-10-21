@@ -1,100 +1,114 @@
 """
-evaluate.py - Evaluation script for computing metrics, confusion matrix, and error galleries.
+evaluate.py - Test-set metrics, confusion matrix, and error gallery.
 """
 
 import argparse
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
+import json
 from pathlib import Path
 
-from src.data import get_data_loaders
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from sklearn.metrics import confusion_matrix
+
+from src.data import CLASSES, get_data_loaders
 from src.model import CNN
+
 
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
-def evaluate_model(checkpoint_path="checkpoints/best.pt"):
-    device = get_device()
-    print(f"Evaluating using device: {device}")
-    
-    # Disable pin_memory if on MPS to avoid warnings
-    pin_memory = device.type == "cuda"
-    _, test_loader, _, _ = get_data_loaders()
-    
-    model = CNN(num_classes=26).to(device)
+
+def load_model(checkpoint_path, device):
     if not Path(checkpoint_path).exists():
-        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}. Please train the model first.")
-        
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    all_preds = []
-    all_targets = []
-    
-    with torch.no_grad():
-        for x, y in test_loader:
-            x_dev = x.to(device)
-            y_dev = y.to(device)
-            if y_dev.min() >= 1 and y_dev.max() <= 26:
-                y_dev = y_dev - 1
-                
-            outputs = model(x_dev)
-            _, predicted = outputs.max(1)
-            
-            all_preds.extend(predicted.cpu().numpy())
-            all_targets.extend(y_dev.cpu().numpy())
-                    
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    
-    accuracy = np.mean(all_preds == all_targets)
-    print(f"Test Accuracy: {accuracy * 100:.2f}%")
-    
-    # Confusion Matrix (rows: true, columns: predicted)
-    cm = confusion_matrix(all_targets, all_preds, labels=range(26))
-    
-    # Find most confused letter pairs (excluding self)
-    cm_no_diag = cm.copy()
-    np.fill_diagonal(cm_no_diag, 0)
-    confusions = []
-    classes = [chr(ord('A') + i) for i in range(26)]
-    
-    for i in range(26):
-        for j in range(26):
-            if i != j and cm_no_diag[i, j] > 0:
-                confusions.append((cm_no_diag[i, j], i, j))
-                
-    confusions.sort(key=lambda x: x[0], reverse=True)
-    
-    print("\nTop 3 Most-Confused Letter Pairs (True -> Predicted):")
-    for count, true_cls, pred_cls in confusions[:3]:
-        print(f"  True '{classes[true_cls]}' misclassified as '{classes[pred_cls]}': {count} times")
-        
-    # Plot Confusion Matrix cleanly
-    plt.figure(figsize=(11, 9))
-    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title("EMNIST Letters Confusion Matrix")
-    plt.colorbar()
-    tick_marks = np.arange(26)
-    plt.xticks(tick_marks, classes)
-    plt.yticks(tick_marks, classes)
-    plt.ylabel("True Label")
-    plt.xlabel("Predicted Label")
-    plt.tight_layout()
-    Path("results").mkdir(parents=True, exist_ok=True)
-    plt.savefig("results/confusion_matrix.png", dpi=300)
-    print("Saved confusion matrix plot to results/confusion_matrix.png")
-    plt.close()
+        raise FileNotFoundError(f"No checkpoint at {checkpoint_path}. Train first: python -m src.train")
+    model = CNN(num_classes=26).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(ckpt["model_state_dict"])
+    return model.eval()
+
+
+@torch.no_grad()
+def predict(model, loader, device):
+    preds, targets, images = [], [], []
+    for x, y in loader:
+        preds.append(model(x.to(device)).argmax(1).cpu())
+        targets.append(y)
+        images.append(x)
+    return torch.cat(preds).numpy(), torch.cat(targets).numpy(), torch.cat(images).squeeze(1).numpy()
+
+
+def plot_confusion_matrix(cm, path):
+    fig, ax = plt.subplots(figsize=(11, 9))
+    im = ax.imshow(cm, cmap="Blues")
+    fig.colorbar(im, ax=ax)
+    ticks = np.arange(26)
+    ax.set_xticks(ticks, CLASSES)
+    ax.set_yticks(ticks, CLASSES)
+    ax.set(title="EMNIST Letters - Test Confusion Matrix", xlabel="Predicted", ylabel="True")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_error_gallery(pairs, preds, targets, images, path, per_pair=6):
+    fig, axes = plt.subplots(len(pairs), per_pair, figsize=(per_pair * 1.4, len(pairs) * 1.7))
+    for row, (true_cls, pred_cls, count) in enumerate(pairs):
+        idx = np.where((targets == true_cls) & (preds == pred_cls))[0][:per_pair]
+        for col in range(per_pair):
+            ax = axes[row, col]
+            ax.axis("off")
+            if col < len(idx):
+                ax.imshow(images[idx[col]], cmap="gray")
+        axes[row, 0].set_title(f"true {CLASSES[true_cls]} -> pred {CLASSES[pred_cls]} ({count})",
+                               loc="left", fontsize=9)
+    fig.suptitle("Most-confused pairs (test set)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def evaluate_model(checkpoint_path="checkpoints/best.pt", num_workers=2):
+    device = get_device()
+    print(f"Device: {device}")
+    _, _, test_loader = get_data_loaders(num_workers=num_workers)
+    model = load_model(checkpoint_path, device)
+
+    preds, targets, images = predict(model, test_loader, device)
+    accuracy = float((preds == targets).mean())
+    print(f"Test accuracy: {100 * accuracy:.2f}% on {len(targets):,} images")
+
+    cm = confusion_matrix(targets, preds, labels=range(26))
+    per_class = cm.diagonal() / cm.sum(axis=1)
+    off_diag = cm.copy()
+    np.fill_diagonal(off_diag, 0)
+    flat = np.argsort(off_diag, axis=None)[::-1][:3]
+    pairs = [(int(i), int(j), int(off_diag[i, j])) for i, j in zip(*np.unravel_index(flat, cm.shape))]
+
+    print("Most-confused pairs (true -> predicted):")
+    for t, p, c in pairs:
+        print(f"  {CLASSES[t]} -> {CLASSES[p]}: {c}")
+
+    Path("results").mkdir(exist_ok=True)
+    plot_confusion_matrix(cm, "results/confusion_matrix.png")
+    plot_error_gallery(pairs, preds, targets, images, "results/error_gallery.png")
+    metrics = dict(
+        test_accuracy=accuracy,
+        test_images=int(len(targets)),
+        per_class_accuracy={CLASSES[i]: float(a) for i, a in enumerate(per_class)},
+        most_confused=[dict(true=CLASSES[t], predicted=CLASSES[p], count=c) for t, p, c in pairs],
+    )
+    Path("results/metrics.json").write_text(json.dumps(metrics, indent=2))
+    print("Saved results/confusion_matrix.png, results/error_gallery.png, results/metrics.json")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate EMNIST Letter Classifier CNN")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt", help="Path to model checkpoint")
+    parser = argparse.ArgumentParser(description="Evaluate the EMNIST letters CNN on the test set")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt")
+    parser.add_argument("--num-workers", type=int, default=2)
     args = parser.parse_args()
-    evaluate_model(checkpoint_path=args.checkpoint)
+    evaluate_model(args.checkpoint, args.num_workers)

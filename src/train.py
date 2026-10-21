@@ -1,123 +1,110 @@
 """
-train.py - Training script for the EMNIST CNN classifier.
+train.py - Train the EMNIST letters CNN.
+
+Selects the best epoch on a held-out validation split and saves it to
+checkpoints/best.pt. The test set is not touched here; see evaluate.py.
 """
 
-import os
 import argparse
+import json
 import time
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from pathlib import Path
 
-from src.data import get_data_loaders
-from src.model import CNN
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 
-def train_model(epochs=10, batch_size=128, lr=1e-3, seed=42, device_str="cuda"):
-    # Set reproducibility seed
+from src.data import get_data_loaders
+from src.model import CNN, count_parameters
+
+
+def run_epoch(model, loader, criterion, device, optimizer=None):
+    """One pass over loader. Trains if optimizer is given, else evaluates."""
+    training = optimizer is not None
+    model.train(training)
+    total_loss, correct, total = 0.0, 0, 0
+    with torch.set_grad_enabled(training):
+        for x, y in loader:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            out = model(x)
+            loss = criterion(out, y)
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            total_loss += loss.item() * x.size(0)
+            correct += (out.argmax(1) == y).sum().item()
+            total += y.size(0)
+    return total_loss / total, correct / total
+
+
+def plot_history(history, path):
+    epochs = [h["epoch"] for h in history]
+    fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(11, 4))
+    ax_loss.plot(epochs, [h["train_loss"] for h in history], marker="o", label="train")
+    ax_loss.plot(epochs, [h["val_loss"] for h in history], marker="o", label="validation")
+    ax_loss.set(title="Loss", xlabel="Epoch", ylabel="Cross-entropy")
+    ax_acc.plot(epochs, [100 * h["train_acc"] for h in history], marker="o", label="train")
+    ax_acc.plot(epochs, [100 * h["val_acc"] for h in history], marker="o", label="validation")
+    ax_acc.set(title="Accuracy", xlabel="Epoch", ylabel="Accuracy (%)")
+    for ax in (ax_loss, ax_acc):
+        ax.grid(alpha=0.3)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def train_model(epochs=10, batch_size=128, lr=1e-3, seed=42, device_str=None, num_workers=2):
     torch.manual_seed(seed)
-    if torch.cuda.is_available() and "cuda" in device_str:
-        torch.cuda.manual_seed_all(seed)
-        device = torch.device(device_str)
-    else:
-      device = torch.device("cpu")
-      
-    print(f"Using device: {device}")
-    
-    # Create necessary directories
-    Path("checkpoints").mkdir(parents=True, exist_ok=True)
-    Path("results").mkdir(parents=True, exist_ok=True)
-    
-    # Load data
-    train_loader, test_loader, train_dataset, test_dataset = get_data_loaders(batch_size=batch_size)
-    
-    # Check label range gotcha (EMNIST letters often run 1-26)
-    sample_labels = train_dataset.targets
-    print(f"Dataset targets range before adjustment: min={sample_labels.min()}, max={sample_labels.max()}")
-    
+    device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+    print(f"Device: {device} ({device_name})")
+
+    Path("checkpoints").mkdir(exist_ok=True)
+    Path("results").mkdir(exist_ok=True)
+
+    train_loader, val_loader, _ = get_data_loaders(batch_size=batch_size, seed=seed, num_workers=num_workers)
+    print(f"Train: {len(train_loader.dataset)}  Val: {len(val_loader.dataset)}")
+
     model = CNN(num_classes=26).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    n_params = count_parameters(model)
+    print(f"Trainable parameters: {n_params:,}")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
-    
-    best_acc = 0.0
-    start_time = time.time()
-    
+
+    history, best_acc, best_epoch = [], 0.0, 0
+    start = time.time()
     for epoch in range(1, epochs + 1):
-        model.train()
-        running_loss = 0.0
-        correct_train = 0
-        total_train = 0
-        
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            
-            # EMNIST letters split labels are 1-26; shift to 0-25 if needed
-            if y.min() >= 1 and y.max() <= 26:
-                y = y - 1
-                
-            optimizer.zero_grad()
-            outputs = model(x)
-            loss = criterion(outputs, y)
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item() * x.size(0)
-            _, predicted = outputs.max(1)
-            total_train += y.size(0)
-            correct_train += predicted.eq(y).sum().item()
-            
-        train_loss = running_loss / total_train
-        train_acc = correct_train / total_train
-        
-        # Evaluate on test set
-        model.eval()
-        test_loss = 0.0
-        correct_test = 0
-        total_test = 0
-        
-        with torch.no_grad():
-            for x, y in test_loader:
-                x, y = x.to(device), y.to(device)
-                if y.min() >= 1 and y.max() <= 26:
-                    y = y - 1
-                    
-                outputs = model(x)
-                loss = criterion(outputs, y)
-                
-                test_loss += loss.item() * x.size(0)
-                _, predicted = outputs.max(1)
-                total_test += y.size(0)
-                correct_test += predicted.eq(y).sum().item()
-                
-        test_loss = test_loss / total_test
-        test_acc = correct_test / total_test
-        
-        print(f"Epoch [{epoch}/{epochs}] | "
-              f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | "
-              f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
-              
-        # Save best checkpoint
-        if test_acc > best_acc:
-            best_acc = test_acc
-            checkpoint_path = "checkpoints/best.pt"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'test_acc': test_acc,
-            }, checkpoint_path)
-            print(f"--> Saved new best model checkpoint to {checkpoint_path} (Acc: {test_acc*100:.2f}%)")
-            
-    total_time = time.time() - start_time
-    print(f"Training completed in {total_time:.2f} seconds. Best Test Accuracy: {best_acc*100:.2f}%")
+        train_loss, train_acc = run_epoch(model, train_loader, criterion, device, optimizer)
+        val_loss, val_acc = run_epoch(model, val_loader, criterion, device)
+        history.append(dict(epoch=epoch, train_loss=train_loss, train_acc=train_acc,
+                            val_loss=val_loss, val_acc=val_acc))
+        print(f"Epoch {epoch:2d}/{epochs} | train loss {train_loss:.4f} acc {100*train_acc:.2f}% "
+              f"| val loss {val_loss:.4f} acc {100*val_acc:.2f}%")
+
+        if val_acc > best_acc:
+            best_acc, best_epoch = val_acc, epoch
+            torch.save({"epoch": epoch, "val_acc": val_acc, "model_state_dict": model.state_dict()},
+                       "checkpoints/best.pt")
+
+    train_time = time.time() - start
+    print(f"Done in {train_time:.1f}s. Best val acc {100*best_acc:.2f}% at epoch {best_epoch}.")
+
+    plot_history(history, "results/training_curves.png")
+    summary = dict(epochs=epochs, batch_size=batch_size, lr=lr, seed=seed, optimizer="Adam",
+                   device=device_name, train_time_sec=round(train_time, 1), parameters=n_params,
+                   best_epoch=best_epoch, best_val_acc=best_acc, history=history)
+    Path("results/training.json").write_text(json.dumps(summary, indent=2))
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train EMNIST Letter Classifier CNN")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs to train")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
-    
+    parser = argparse.ArgumentParser(description="Train the EMNIST letters CNN")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default=None, help="cuda or cpu (default: auto)")
+    parser.add_argument("--num-workers", type=int, default=2)
     args = parser.parse_args()
-    train_model(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, seed=args.seed, device_str=args.device)
+    train_model(args.epochs, args.batch_size, args.lr, args.seed, args.device, args.num_workers)
